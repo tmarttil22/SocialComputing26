@@ -5,9 +5,10 @@ import collections
 import json
 import sqlite3
 import hashlib
+import secrets
 import re
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 
 app = Flask(__name__)
@@ -95,6 +96,23 @@ def ensure_co_creation_schema():
             db.execute('ALTER TABLE posts ADD COLUMN coauthor_id INTEGER')
         if 'coauthor_content' not in post_columns:
             db.execute('ALTER TABLE posts ADD COLUMN coauthor_content TEXT')
+        user_columns = {row['name'] for row in db.execute('PRAGMA table_info(users)')}
+        if 'phone_number' not in user_columns:
+            db.execute('ALTER TABLE users ADD COLUMN phone_number TEXT')
+        db.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_number
+            ON users (phone_number)
+        ''')
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS pending_signups (
+                username TEXT PRIMARY KEY,
+                password TEXT NOT NULL,
+                location TEXT,
+                birthdate DATE,
+                profile TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+            )
+        ''')
         db.execute('''
             CREATE TABLE IF NOT EXISTS co_creation_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +128,22 @@ def ensure_co_creation_schema():
             )
         ''')
     app.config['_co_creation_schema_ready'] = True
+
+
+PHONE_NUMBER_PATTERN = re.compile(r'^\+[1-9]\d{6,14}$')
+
+
+def require_verified_phone(user_id):
+    user = query_db(
+        'SELECT phone_number FROM users WHERE id = ?',
+        (user_id,),
+        one=True
+    )
+    if user and user['phone_number']:
+        return None
+
+    flash('Link and verify a unique phone number before posting or commenting.', 'warning')
+    return redirect(url_for('verify_phone'))
 
 @app.template_filter('datetimeformat')
 def datetimeformat(value):
@@ -327,6 +361,10 @@ def add_post():
         flash('You must be logged in to create a post.', 'danger')
         return redirect(url_for('login'))
 
+    phone_redirect = require_verified_phone(user_id)
+    if phone_redirect:
+        return phone_redirect
+
     # Get content from the submitted form
     content = request.form.get('content')
     coauthor_id_value = request.form.get('coauthor_id', '').strip()
@@ -380,6 +418,10 @@ def complete_co_post_request(request_id):
     if not user_id:
         flash('You must be logged in to complete a co-post request.', 'danger')
         return redirect(url_for('login'))
+
+    phone_redirect = require_verified_phone(user_id)
+    if phone_redirect:
+        return phone_redirect
 
     coauthor_content = request.form.get('coauthor_content', '')
     if not coauthor_content.strip():
@@ -665,6 +707,9 @@ def privacy():
 
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
+    if session.get('pending_signup_username'):
+        return redirect(url_for('verify_phone'))
+
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
@@ -673,35 +718,195 @@ def signup():
         profile = request.form.get('profile', '')
 
         hashed_password = generate_password_hash(password)
+        existing_user = query_db(
+            'SELECT id FROM users WHERE username = ?',
+            (username,),
+            one=True
+        )
+        if existing_user:
+            flash('Username already taken. Please choose another one.', 'danger')
+            return render_template('signup.html.j2')
+
+        existing_pending_signup = query_db(
+            'SELECT 1 FROM pending_signups WHERE username = ?',
+            (username,),
+            one=True
+        )
+        if existing_pending_signup:
+            flash('A sign-up with that username is already awaiting phone verification.', 'danger')
+            return render_template('signup.html.j2')
 
         db = get_db()
-        cur = db.cursor()
         try:
-            cur.execute(
-                'INSERT INTO users (username, password, location, birthdate, profile) VALUES (?, ?, ?, ?, ?)',
-                (username, hashed_password, location, birthdate, profile)
-            )
-            db.commit()
-
-            # 1. Get the ID of the user we just created.
-            new_user_id = cur.lastrowid
-
-            # 2. Add user info to the session cookie.
-            session.clear() # Clear any old session data
-            session['user_id'] = new_user_id
-            session['username'] = username
-
-            # 3. Flash a welcome message and redirect to the feed.
-            flash(f'Welcome, {username}! Your account has been created.', 'success')
-            return redirect(url_for('feed')) # Redirect to the main feed/dashboard
-
+            with db:
+                db.execute(
+                    '''INSERT INTO pending_signups
+                       (username, password, location, birthdate, profile)
+                       VALUES (?, ?, ?, ?, ?)''',
+                    (
+                        username,
+                        hashed_password,
+                        location,
+                        birthdate,
+                        profile,
+                    )
+                )
         except sqlite3.IntegrityError:
-            flash('Username already taken. Please choose another one.', 'danger')
-        finally:
-            cur.close()
-            db.close()
-            
+            flash('A sign-up with that username is already awaiting phone verification.', 'danger')
+            return render_template('signup.html.j2')
+        session.clear()
+        session['pending_signup_username'] = username
+        return redirect(url_for('verify_phone'))
+
     return render_template('signup.html.j2')
+
+
+@app.route('/verify-phone', methods=['GET', 'POST'])
+def verify_phone():
+    pending_signup_username = session.get('pending_signup_username')
+    pending_signup = None
+    if pending_signup_username:
+        pending_signup = query_db(
+            '''SELECT username, password, location, birthdate, profile
+               FROM pending_signups WHERE username = ?''',
+            (pending_signup_username,),
+            one=True
+        )
+    user_id = session.get('user_id')
+    if pending_signup_username and not pending_signup:
+        session.pop('pending_signup_username', None)
+        session.pop('phone_verification', None)
+        flash('Your pending sign-up was not found. Please sign up again.', 'warning')
+        return redirect(url_for('signup'))
+    if not pending_signup and not user_id:
+        flash('Sign up or log in before linking a phone number.', 'warning')
+        return redirect(url_for('signup'))
+
+    if user_id:
+        user = query_db(
+            'SELECT phone_number FROM users WHERE id = ?',
+            (user_id,),
+            one=True
+        )
+        if user and user['phone_number']:
+            session.pop('phone_verification', None)
+            flash('Your account already has a linked phone number.', 'info')
+            return redirect(url_for('feed'))
+
+    if request.method == 'POST':
+        verification_step = request.form.get('step')
+        if verification_step == 'change_number':
+            session.pop('phone_verification', None)
+        elif verification_step == 'send_code':
+            session.pop('phone_verification', None)
+            phone_number = request.form.get('phone_number', '').strip()
+            if not PHONE_NUMBER_PATTERN.fullmatch(phone_number):
+                flash('Enter a valid phone number in international format, such as +358401234567.', 'warning')
+            else:
+                if user_id:
+                    existing_number = query_db(
+                        'SELECT id FROM users WHERE phone_number = ? AND id != ?',
+                        (phone_number, user_id),
+                        one=True
+                    )
+                else:
+                    existing_number = query_db(
+                        'SELECT id FROM users WHERE phone_number = ?',
+                        (phone_number,),
+                        one=True
+                    )
+
+                if existing_number:
+                    flash('That phone number is already linked to an account.', 'danger')
+                else:
+                    verification_code = f'{secrets.randbelow(1_000_000):06d}'
+                    session['phone_verification'] = {
+                        'phone_number': phone_number,
+                        'code': verification_code,
+                    }
+                    flash('A confirmation code has been sent to your simulated phone.', 'info')
+        elif verification_step == 'confirm_code':
+            verification = session.get('phone_verification')
+            submitted_code = request.form.get('confirmation_code', '')
+            if not verification or not submitted_code.isdigit() or len(submitted_code) != 6:
+                flash('Enter the six-digit confirmation code.', 'warning')
+            elif not secrets.compare_digest(submitted_code, verification['code']):
+                flash('The confirmation code is incorrect.', 'danger')
+            else:
+                phone_number = verification['phone_number']
+                if pending_signup:
+                    db = get_db()
+                    try:
+                        with db:
+                            cursor = db.execute(
+                                '''INSERT INTO users
+                                   (username, password, location, birthdate, profile, phone_number)
+                                   VALUES (?, ?, ?, ?, ?, ?)''',
+                                (
+                                    pending_signup['username'],
+                                    pending_signup['password'],
+                                    pending_signup['location'],
+                                    pending_signup['birthdate'],
+                                    pending_signup['profile'],
+                                    phone_number,
+                                )
+                            )
+                            db.execute(
+                                'DELETE FROM pending_signups WHERE username = ?',
+                                (pending_signup_username,)
+                            )
+                    except sqlite3.IntegrityError:
+                        existing_user = query_db(
+                            'SELECT id FROM users WHERE username = ?',
+                            (pending_signup_username,),
+                            one=True
+                        )
+                        session.pop('phone_verification', None)
+                        if existing_user:
+                            with db:
+                                db.execute(
+                                    'DELETE FROM pending_signups WHERE username = ?',
+                                    (pending_signup_username,)
+                                )
+                            session.pop('pending_signup_username', None)
+                            flash('That username is already in use. Please sign up again.', 'danger')
+                            return redirect(url_for('signup'))
+                        flash('That phone number is already linked to an account. Try another number.', 'danger')
+                        return render_template(
+                            'verify_phone.html.j2',
+                            phone_number='',
+                            demo_code=None,
+                            is_signup=True,
+                        )
+
+                    new_user_id = cursor.lastrowid
+                    username = pending_signup['username']
+                    session.clear()
+                    session['user_id'] = new_user_id
+                    session['username'] = username
+                    flash(f'Welcome, {username}! Your account has been created and your phone number verified.', 'success')
+                    return redirect(url_for('feed'))
+
+                db = get_db()
+                with db:
+                    db.execute(
+                        'UPDATE users SET phone_number = ? WHERE id = ?',
+                        (phone_number, user_id)
+                    )
+                session.pop('phone_verification', None)
+                flash('Your phone number has been verified and linked.', 'success')
+                return redirect(url_for('feed'))
+        else:
+            flash('Choose a phone number before entering a confirmation code.', 'warning')
+
+    verification = session.get('phone_verification')
+    return render_template(
+        'verify_phone.html.j2',
+        phone_number=verification['phone_number'] if verification else '',
+        demo_code=verification['code'] if verification else None,
+        is_signup=bool(pending_signup),
+    )
+
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -718,6 +923,7 @@ def login():
         #    This function handles the salt and prevents timing attacks.
         if user and check_password_hash(user['password'], password):
             # Password is correct!
+            session.clear()
             session['user_id'] = user['id']
             session['username'] = user['username']
             flash('Logged in successfully.', 'success')
@@ -743,6 +949,10 @@ def add_comment(post_id):
     if not user_id:
         flash('You must be logged in to comment.', 'danger')
         return redirect(url_for('login'))
+
+    phone_redirect = require_verified_phone(user_id)
+    if phone_redirect:
+        return phone_redirect
 
     # Get content from the submitted form
     content = request.form.get('content')
@@ -1192,68 +1402,55 @@ def user_risk_analysis(user_id):
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-    
-    score = 0
-    profile_score = 0
-    average_post_score = 0
-    average_comment_score = 0 
-    
-    post_risk_multiplier = 1
-    user_risk_multiplier = 1
 
-    # Extra risk analysis
-    username = query_db("SELECT username FROM users WHERE id = ?", (user_id,), one=True)
-    if username in TIER1_WORDS:
-        query_db("UPDATE users SET username = [Inappropriate username] WHERE id = ?", (user_id,), commit=True)
-        return 5.0
-    if username in TIER3_WORDS:
-        profile_score += 0.75
+    user = query_db(
+        'SELECT profile, created_at FROM users WHERE id = ?',
+        (user_id,),
+        one=True
+    )
+    profile = user['profile'] or ''
+    _, profile_score = moderate_content(profile)
 
-    # 2.1
-    posts_content = query_db("SELECT content FROM posts WHERE user_id = ?", (user_id,))
-    for post in posts_content:
-        _, post_risk_score = moderate_content(post['content'])
-        average_post_score += post_risk_score
-    
-    result = query_db("SELECT created_at FROM users WHERE id = ?", (user_id,), one=True) 
-    db_timestamp = result["created_at"]
-    account_age = datetime.now() - db_timestamp
-    if account_age < timedelta(days=7):
-        # Apply multiplier if account is younger than 7 days, otherwise multiplier at correct value of 1
-        post_risk_multiplier = 1.5
-    average_post_score *= post_risk_multiplier
-    if 0 < len(posts_content):
-        average_post_score = average_post_score / len(posts_content)
+    posts = query_db('''
+        SELECT content
+        FROM posts
+        WHERE user_id = ?
+        UNION ALL
+        SELECT coauthor_content AS content
+        FROM posts
+        WHERE coauthor_id = ? AND coauthor_content IS NOT NULL
+    ''', (user_id, user_id))
+    post_scores = [moderate_content(post['content'])[1] for post in posts]
+    average_post_score = sum(post_scores) / len(post_scores) if post_scores else 0.0
 
-    comments_content = query_db("SELECT content FROM comments WHERE user_id = ?", (user_id,))
-    for comment in comments_content:
-        _, comment_risk_score = moderate_content(comment['content'])
-        average_comment_score += comment_risk_score
-    if 0 < len(comments_content):
-        average_comment_score = average_comment_score / len(comments_content)
+    comments = query_db(
+        'SELECT content FROM comments WHERE user_id = ?',
+        (user_id,)
+    )
+    comment_scores = [moderate_content(comment['content'])[1] for comment in comments]
+    average_comment_score = (
+        sum(comment_scores) / len(comment_scores) if comment_scores else 0.0
+    )
 
-    # 2.2 
-    profile_content = query_db("SELECT profile FROM users WHERE id = ?", (user_id,), one=True)
-    if profile_content:
-        profile = profile_content["profile"]
-        if profile is not None:
-            _, _profile_score = moderate_content(profile)
-            profile_score += _profile_score
+    content_risk_score = profile_score + (average_post_score * 3) + average_comment_score
+    account_age = datetime.now() - user['created_at']
+    if account_age.days < 7:
+        content_risk_score *= 1.5
+    elif account_age.days < 30:
+        content_risk_score *= 1.2
+
+    if content_risk_score > 5.0:
+        content_risk_score = 5.0
+
+    return content_risk_score
 
     
+def remove_url(match):
+    url = match.group(0)
+    trailing_punctuation = url[len(url.rstrip('.,!?;:)')):]
+    return '[link removed]' + trailing_punctuation
 
-    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
 
-    if account_age < timedelta(days=7):
-        user_risk_multiplier = 1.5
-    elif account_age < timedelta(days=30):
-        user_risk_multiplier = 1.2
-    
-    score = content_risk_score * user_risk_multiplier
-
-    return score
-
-    
 def moderate_content(content):
     """
     Args
@@ -1272,48 +1469,59 @@ def moderate_content(content):
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
-    original_content = content 
-    score = 0
+    score = 0.0
 
-    lowercase_content = original_content.lower()
-    words = re.findall(r"\b\w+\b", lowercase_content)
-    for word in words:
-        if word in TIER1_WORDS:
-            return "[content removed due to severe violation]", 5.0
-    
-    for phrase in TIER2_PHRASES:
-        if phrase in lowercase_content:
-            return "[content removed due to severe violation]", 5.0
-    
-    TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
-
-    matches = re.findall(TIER3_PATTERN, lowercase_content)
-    score += len(matches) * 2
-    moderated_content = re.sub(TIER3_PATTERN, lambda m: '*' * len(m.group(0)), original_content)
-
-    # REGEX from https://regexr.com/39p0t
-    URL_REGEX = re.compile(
-        r'(https?:\/\/)?([\w\-])+\.{1}([a-zA-Z]{2,63})([\/\w-]*)*\/?\??([^#\n\r]*)?#?([^\n\r]*)'
-        , re.IGNORECASE
+    tier1_pattern = re.compile(
+        r'\b(?:' + '|'.join(re.escape(word) for word in TIER1_WORDS) + r')\b',
+        re.IGNORECASE
     )
-    url_matches = re.findall(URL_REGEX, lowercase_content)
-    score += len(url_matches) * 2
-    moderated_content = re.sub(URL_REGEX, lambda m: '[link removed]', original_content)
+    if tier1_pattern.search(content):
+        return "[content removed due to severe violation]", 5.0
 
-    chars = re.findall("A-Za-z", original_content)
-    charCount = len(chars)
-    if charCount > 15:
-        uppercase = sum(1 for c in chars if c.isUpper())
-        if uppercase / charCount >= 0.7:
+    tier2_pattern = re.compile(
+        r'(?<!\w)(?:' + '|'.join(
+            re.escape(phrase)
+            for phrase in sorted(TIER2_PHRASES, key=len, reverse=True)
+        ) + r')(?!\w)',
+        re.IGNORECASE
+    )
+    if tier2_pattern.search(content):
+        return "[content removed due to spam/scam policy]", 5.0
+
+    tier3_pattern = re.compile(
+        r'\b(?:' + '|'.join(
+            re.escape(word) for word in sorted(TIER3_WORDS, key=len, reverse=True)
+        ) + r')\b',
+        re.IGNORECASE
+    )
+    tier3_matches = list(tier3_pattern.finditer(content))
+    score += len(tier3_matches) * 2.0
+    moderated_content = tier3_pattern.sub(
+        lambda match: '*' * len(match.group(0)),
+        content
+    )
+
+    url_pattern = re.compile(
+        r'\b(?:https?://|www\.)[^\s<>"\']+'
+        r'|\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}'
+        r'(?:[/?#][^\s<>"\']*)?',
+        re.IGNORECASE
+    )
+    url_matches = list(url_pattern.finditer(moderated_content))
+    score += len(url_matches) * 2.0
+
+    for url_match in url_matches:
+        moderated_content = moderated_content.replace(
+            url_match.group(0),
+            remove_url(url_match),
+            1
+        )
+
+    letters = [character for character in content if character.isalpha()]
+    if len(letters) > 15:
+        uppercase_ratio = sum(character.isupper() for character in letters) / len(letters)
+        if uppercase_ratio > 0.7:
             score += 0.5
-
-    # CHECK FOR REPEATED SPAM CONTENT (e.g "buy buy buy buy buy")
-    # REGEX from https://regex101.com/r/CZQ7IK/1, slightly modified
-    REPEAT_REGEX = re.compile(
-        r'(\b((?:\w+(?:\W+\w+){0,5}))\b(?:\W*\2\b){4,})'
-    )
-    spam_matches = re.findall(REPEAT_REGEX, lowercase_content)
-    score += len(spam_matches) * 0.5
 
     return moderated_content, score
 

@@ -1,0 +1,73 @@
+{% extends "base.html.j2" %}
+{% block content %}
+<div class="container col-md-7 mx-auto mt-5 mb-5">
+  <div class="card shadow-sm p-4">
+    <h2 class="mb-3 text-center">
+      {% if is_signup %}Final signup step: link your phone{% else %}Link your phone number{% endif %}
+    </h2>
+    <p class="text-muted text-center">
+      Use a unique phone number in international format, for example <code>+358401234567</code>.
+    </p>
+
+    {% if demo_code %}
+    <div class="alert alert-info" role="status">
+      We sent a six-digit confirmation code to {{ phone_number }}. Enter it below to finish.
+    </div>
+    <form method="POST">
+      <input type="hidden" name="step" value="confirm_code">
+      <div class="mb-3">
+        <label for="confirmation-code" class="form-label">Confirmation code</label>
+        <input
+          type="text"
+          class="form-control"
+          id="confirmation-code"
+          name="confirmation_code"
+          inputmode="numeric"
+          pattern="[0-9]{6}"
+          maxlength="6"
+          autocomplete="one-time-code"
+          required>
+      </div>
+      <button type="submit" class="btn btn-primary">
+        {% if is_signup %}Verify and create account{% else %}Verify and link number{% endif %}
+      </button>
+    </form>
+    <form method="POST" class="mt-2">
+      <input type="hidden" name="step" value="change_number">
+      <button type="submit" class="btn btn-link px-0">Use a different number</button>
+    </form>
+    {% else %}
+    <form method="POST">
+      <input type="hidden" name="step" value="send_code">
+      <div class="mb-3">
+        <label for="phone-number" class="form-label">Phone number</label>
+        <input
+          type="tel"
+          class="form-control"
+          id="phone-number"
+          name="phone_number"
+          placeholder="+358401234567"
+          pattern="\+[1-9][0-9]{6,14}"
+          autocomplete="tel"
+          required>
+        <div class="form-text">Enter a number with a leading + and country code, without spaces.</div>
+      </div>
+      <button type="submit" class="btn btn-primary">Send confirmation code</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<aside class="card shadow phone-demo-popup position-fixed bottom-0 end-0 m-3" role="status" aria-live="polite" style="z-index: 1060; width: min(20rem, calc(100vw - 2rem));">
+  <div class="card-header">Demo phone</div>
+  <div class="card-body">
+    <p class="mb-2">This popup imitates an actual phone. No text message is sent.</p>
+    {% if demo_code %}
+    <p class="mb-1 text-muted small">Simulated confirmation text</p>
+    <p class="mb-0 fs-4 fw-bold text-center" aria-label="Demo confirmation code">{{ demo_code }}</p>
+    {% else %}
+    <p class="mb-0 text-muted small">A demo confirmation code will appear here after you submit a valid number.</p>
+    {% endif %}
+  </div>
+</aside>
+{% endblock %}
