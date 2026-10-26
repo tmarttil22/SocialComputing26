@@ -115,8 +115,18 @@
                     {% for post in posts %}
                     <tr>
                         <td>{{ post.id }}</td>
-                        <td><a href="{{ url_for('user_profile', username=post.username) }}">{{ post.username }}</a></td>
-                        <td style="max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="{{ post.content }}"><a href="{{ url_for('post_detail', post_id=post.id) }}">{{ post.content }}</a></td>
+                        <td>
+                            <a href="{{ url_for('user_profile', username=post.username) }}">{{ post.username }}</a>
+                            {% if post.coauthor_id %}
+                            &amp; <a href="{{ url_for('user_profile', username=post.coauthor_username) }}">{{ post.coauthor_username }}</a>
+                            {% endif %}
+                        </td>
+                        <td style="max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="{{ post.content }}{% if post.coauthor_content %} | {{ post.coauthor_content }}{% endif %}">
+                            <a href="{{ url_for('post_detail', post_id=post.id) }}"><strong>@{{ post.username }}:</strong> {{ post.content }}</a>
+                            {% if post.coauthor_id %}
+                            <br><a href="{{ url_for('post_detail', post_id=post.id) }}"><strong>@{{ post.coauthor_username }}:</strong> {{ post.coauthor_content }}</a>
+                            {% endif %}
+                        </td>
                         <td>{{ post.created_at|datetimeformat }}</td>
                         <td>
                             {% if post.risk_label == "HIGH" %}

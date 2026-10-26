@@ -10,7 +10,10 @@
 <div class="col-md-8 mx-auto mb-4">
   <div class="card shadow-sm">
     <div class="card-body">
-      <h5 class="card-title">Create a new post</h5>
+      <div class="d-flex justify-content-between align-items-start">
+        <h5 class="card-title">Create a new post</h5>
+        <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('co_post_requests') }}">Co-post requests</a>
+      </div>
       {% if suggested_hashtag %}
       <p>We think you're interested in {{ suggested_hashtag }}, post your thoughts about it!</p>
       {% else %}
@@ -25,7 +28,7 @@
         </button>
         <ul class="dropdown-menu" aria-labelledby="coauthorDropdown">
           {% for user in coauthor_users %}
-          <li><button class="dropdown-item coauthor-option" type="button" data-username="{{ user.username }}">@{{ user.username }}</button></li>
+          <li><button class="dropdown-item coauthor-option" type="button" data-user-id="{{ user.id }}" data-username="{{ user.username }}">@{{ user.username }}</button></li>
           {% else %}
           <li><span class="dropdown-item-text text-muted">No other members available.</span></li>
           {% endfor %}
@@ -37,7 +40,8 @@
         <div class="mb-3">
           <textarea class="form-control" name="content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" required></textarea>
         </div>
-        <button type="submit" class="btn btn-primary float-end">Post</button>
+        <input type="hidden" name="coauthor_id" id="coauthor-id" value="">
+        <button type="submit" id="post-submit" class="btn btn-primary float-end">Post</button>
       </form>
     </div>
   </div>
@@ -48,12 +52,15 @@
   document.querySelectorAll('.coauthor-option').forEach((option) => {
     option.addEventListener('click', () => {
       const username = option.dataset.username;
+      const userId = option.dataset.userId;
       const selected = document.getElementById('coauthor-selected');
       const note = document.getElementById('coauthor-note');
       const currentUsername = document.getElementById('coauthorDropdown').dataset.currentUsername;
+      document.getElementById('coauthor-id').value = userId;
+      document.getElementById('post-submit').textContent = 'Send for co-creation';
       selected.textContent = `Post authors: @${currentUsername} and @${username}`;
       selected.classList.remove('d-none');
-      note.textContent = `Clicking 'Post' will send the post to @${username} for them to add their thoughts before posting`;
+      note.textContent = `Send this post to @${username} to add their thoughts before it is published.`;
       note.classList.remove('d-none');
     });
   });
@@ -91,15 +98,18 @@
       <div class="d-flex justify-content-between align-items-center">
         <h3 class="card-title mb-0">
           {% if entry.followed_poster %}
-          <a href="/u/{{ entry.post.user_id }}">{{ user_display(entry.post.username) }}<span class="text-success p-1" data-toggle="tooltip" data-placement="top" title="You are following this user"> ✓ </span>
-</a>
+            {{ user_display(entry.post.username) }}<span class="text-success p-1" data-toggle="tooltip" data-placement="top" title="You are following this user"> ✓ </span>
           {% else %}
-          <a href="/u/{{ entry.post.user_id }}">{{ user_display(entry.post.username) }} </a>
+            {{ user_display(entry.post.username) }}
+          {% endif %}
+          {% if entry.post.coauthor_id %}
+            <span class="text-muted">and</span>
+            {{ user_display(entry.post.coauthor_username) }}
           {% endif %}
         </h3>
 
         
-        {% if session.get('user_id') == entry.post.user_id %}
+        {% if session.get('user_id') == entry.post.user_id or session.get('user_id') == entry.post.coauthor_id %}
         <div class="d-flex align-items-center">
             <small class="text-muted me-3">{{ entry.post.created_at|datetimeformat }}</small>
             <form action="{{ url_for('delete_post', post_id=entry.post.id) }}" method="POST" onsubmit="return confirm('Are you sure you want to delete this post?');">
@@ -113,7 +123,12 @@
         {% endif %}
       </div>
       
-      <p class="mt-2">{{ entry.post.content }}</p>
+      <div class="mt-2">
+        <p class="mb-2"><strong>@{{ entry.post.username }}</strong><br>{{ entry.post.content }}</p>
+        {% if entry.post.coauthor_id %}
+        <p class="mb-2"><strong>@{{ entry.post.coauthor_username }}</strong><br>{{ entry.post.coauthor_content }}</p>
+        {% endif %}
+      </div>
 
       <!-- Reactions Display and Add Reaction Button -->
       <div class="d-flex align-items-center mt-2 mb-2">

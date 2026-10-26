@@ -1,0 +1,30 @@
+{% extends "base.html.j2" %}
+{% block content %}
+<div class="col-md-8 mx-auto pt-4">
+  <h2 class="mb-4">Co-post requests</h2>
+
+  <h3 class="h5 mb-3">Requests for you</h3>
+  {% for request_item in incoming_requests %}
+  <div class="card shadow-sm mb-3">
+    <div class="card-body">
+      <p class="text-muted mb-2">
+        <a href="{{ url_for('user_profile', username=request_item.author_username) }}">@{{ request_item.author_username }}</a>
+        invited you to co-create a post.
+      </p>
+      <div class="border rounded bg-light p-3 mb-3">
+        <strong>Original text from @{{ request_item.author_username }}</strong>
+        <p class="mb-0 mt-2" style="white-space: pre-wrap;">{{ request_item.content }}</p>
+      </div>
+      <form action="{{ url_for('complete_co_post_request', request_id=request_item.id) }}" method="POST">
+        <label for="coauthor-content-{{ request_item.id }}" class="form-label">Add your text</label>
+        <textarea class="form-control mb-3" id="coauthor-content-{{ request_item.id }}" name="coauthor_content" rows="3" required></textarea>
+        <button type="submit" class="btn btn-primary">Publish co-created post</button>
+      </form>
+    </div>
+  </div>
+  {% else %}
+  <p class="text-muted">You have no pending co-post requests.</p>
+  {% endfor %}
+
+</div>
+{% endblock %}

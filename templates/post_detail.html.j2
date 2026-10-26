@@ -7,9 +7,13 @@
     <div class="card-body">
       <div class="d-flex justify-content-between align-items-center">
         <h3 class="card-title mb-0">
-          <a href="/u/{{ post.user_id }}">{{ user_display(post.username) }}</a>
+          {{ user_display(post.username) }}
+          {% if post.coauthor_id %}
+          <span class="text-muted">and</span>
+          {{ user_display(post.coauthor_username) }}
+          {% endif %}
         </h3>
-        {% if session.get('user_id') == post.user_id %}
+        {% if session.get('user_id') == post.user_id or session.get('user_id') == post.coauthor_id %}
         <div class="d-flex align-items-center">
             <small class="text-muted me-3">{{ post.created_at|datetimeformat }}</small>
             <form action="{{ url_for('delete_post', post_id=post.id) }}" method="POST" onsubmit="return confirm('Are you sure you want to delete this post?');">
@@ -23,7 +27,12 @@
         {% endif %}
       </div>
       
-      <p class="card-text mt-2">{{ post.content }}</p>
+      <div class="mt-2">
+        <p class="card-text mb-2"><strong>@{{ post.username }}</strong><br>{{ post.content }}</p>
+        {% if post.coauthor_id %}
+        <p class="card-text mb-2"><strong>@{{ post.coauthor_username }}</strong><br>{{ post.coauthor_content }}</p>
+        {% endif %}
+      </div>
 
       <!-- Reactions Display and Add Reaction Button (Copied from feed.html.j2) -->
       <div class="d-flex align-items-center mt-2 mb-2">

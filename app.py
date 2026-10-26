@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+from flask import Flask, abort, render_template, request, redirect, url_for, session, flash, g
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
@@ -80,6 +80,36 @@ def query_db(query, args=(), one=False, commit=False):
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return None
+
+
+@app.before_request
+def ensure_co_creation_schema():
+    if app.config.get('_co_creation_schema_ready'):
+        return
+
+    db = get_db()
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        post_columns = {row['name'] for row in db.execute('PRAGMA table_info(posts)')}
+        if 'coauthor_id' not in post_columns:
+            db.execute('ALTER TABLE posts ADD COLUMN coauthor_id INTEGER')
+        if 'coauthor_content' not in post_columns:
+            db.execute('ALTER TABLE posts ADD COLUMN coauthor_content TEXT')
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS co_creation_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                author_id INTEGER NOT NULL,
+                coauthor_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                post_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                FOREIGN KEY (author_id) REFERENCES users(id),
+                FOREIGN KEY (coauthor_id) REFERENCES users(id),
+                FOREIGN KEY (post_id) REFERENCES posts(id)
+            )
+        ''')
+    app.config['_co_creation_schema_ready'] = True
 
 @app.template_filter('datetimeformat')
 def datetimeformat(value):
@@ -177,18 +207,21 @@ def feed():
     #  2. Build the Query 
     where_clause = ""
     if show == 'following' and current_user_id:
-        where_clause = "WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
-        params.append(current_user_id)
+        where_clause = """WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)
+                          OR p.coauthor_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"""
+        params.extend((current_user_id, current_user_id))
 
     # Add the pagination parameters to the query arguments
     pagination_params = (POSTS_PER_PAGE, offset)
 
     if sort == 'popular':
         query = f"""
-            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id,
+            SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.created_at,
+                   u.username, u.id as user_id, coauthor.username as coauthor_username,
                    IFNULL(r.total_reactions, 0) as total_reactions
             FROM posts p
             JOIN users u ON p.user_id = u.id
+            LEFT JOIN users coauthor ON p.coauthor_id = coauthor.id
             LEFT JOIN (
                 SELECT post_id, COUNT(*) as total_reactions FROM reactions GROUP BY post_id
             ) r ON p.id = r.post_id
@@ -202,9 +235,11 @@ def feed():
         posts = recommend(current_user_id, show == 'following' and current_user_id)
     else:  # Default sort is 'new'
         query = f"""
-            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.created_at,
+                   u.username, u.id as user_id, coauthor.username as coauthor_username
             FROM posts p
             JOIN users u ON p.user_id = u.id
+            LEFT JOIN users coauthor ON p.coauthor_id = coauthor.id
             {where_clause}
             ORDER BY p.created_at DESC
             LIMIT ? OFFSET ?
@@ -214,7 +249,7 @@ def feed():
 
     posts_data = []
     for post in posts:
-        # Determine if the current user follows the poster
+        # Determine if the current user follows the main author
         followed_poster = False
         if current_user_id and post['user_id'] != current_user_id:
             follow_check = query_db(
@@ -240,6 +275,8 @@ def feed():
         comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
         post_dict = dict(post)
         post_dict['content'], _ = moderate_content(post_dict['content'])
+        if post_dict.get('coauthor_content'):
+            post_dict['coauthor_content'], _ = moderate_content(post_dict['coauthor_content'])
         comments_moderated = []
         for comment in comments_raw:
             comment_dict = dict(comment)
@@ -292,22 +329,99 @@ def add_post():
 
     # Get content from the submitted form
     content = request.form.get('content')
-
-    # Pass the user's content through the moderation function
-    moderated_content = content
+    coauthor_id_value = request.form.get('coauthor_id', '').strip()
 
     # Basic validation to ensure post is not empty
-    if moderated_content and moderated_content.strip():
-        db = get_db()
-        db.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)',
-                   (user_id, moderated_content))
-        db.commit()
-        flash('Your post was successfully created!', 'success')
-    else:
-        # This will catch empty posts or posts that were fully censored
+    if not content or not content.strip():
         flash('Post cannot be empty or was fully censored.', 'warning')
+        return redirect(url_for('feed'))
+
+    if coauthor_id_value:
+        db = get_db()
+        with db:
+            db.execute(
+                'INSERT INTO co_creation_requests (author_id, coauthor_id, content) VALUES (?, ?, ?)',
+                (user_id, coauthor_id_value, content)
+            )
+        flash('Your post was sent for co-creation.', 'success')
+    else:
+        db = get_db()
+        with db:
+            db.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)', (user_id, content))
+        flash('Your post was successfully created!', 'success')
 
     # Redirect back to the main feed to see the new post
+    return redirect(url_for('feed'))
+
+
+@app.route('/co-post-requests')
+def co_post_requests():
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to view co-post requests.', 'danger')
+        return redirect(url_for('login'))
+
+    incoming_requests = query_db('''
+        SELECT r.id, r.content, r.created_at, u.id AS author_id, u.username AS author_username
+        FROM co_creation_requests r
+        JOIN users u ON r.author_id = u.id
+        WHERE r.coauthor_id = ? AND r.status = 'pending'
+        ORDER BY r.created_at DESC, r.id DESC
+    ''', (user_id,))
+    return render_template(
+        'co_post_requests.html.j2',
+        incoming_requests=incoming_requests
+    )
+
+
+@app.route('/co-post-requests/<int:request_id>/complete', methods=['POST'])
+def complete_co_post_request(request_id):
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to complete a co-post request.', 'danger')
+        return redirect(url_for('login'))
+
+    coauthor_content = request.form.get('coauthor_content', '')
+    if not coauthor_content.strip():
+        flash('Add your text before publishing the co-created post.', 'warning')
+        return redirect(url_for('co_post_requests'))
+
+    co_creation_request = query_db(
+        '''SELECT id, author_id, coauthor_id, content
+           FROM co_creation_requests
+           WHERE id = ? AND coauthor_id = ? AND status = 'pending' ''',
+        (request_id, user_id),
+        one=True
+    )
+    if not co_creation_request:
+        flash('This co-post request is no longer available.', 'danger')
+        return redirect(url_for('co_post_requests'))
+
+    db = get_db()
+    with db:
+        updated = db.execute(
+            '''UPDATE co_creation_requests SET status = 'completed'
+               WHERE id = ? AND coauthor_id = ? AND status = 'pending' ''',
+            (request_id, user_id)
+        )
+        if updated.rowcount != 1:
+            flash('This co-post request has already been completed.', 'warning')
+            return redirect(url_for('co_post_requests'))
+        post_cursor = db.execute(
+            '''INSERT INTO posts (user_id, content, coauthor_id, coauthor_content)
+               VALUES (?, ?, ?, ?)''',
+            (
+                co_creation_request['author_id'],
+                co_creation_request['content'],
+                user_id,
+                coauthor_content
+            )
+        )
+        db.execute(
+            'UPDATE co_creation_requests SET post_id = ? WHERE id = ?',
+            (post_cursor.lastrowid, request_id)
+        )
+    flash('The co-created post has been published.', 'success')
     return redirect(url_for('feed'))
     
     
@@ -322,14 +436,14 @@ def delete_post(post_id):
         return redirect(url_for('login'))
 
     # Find the post in the database
-    post = query_db('SELECT id, user_id FROM posts WHERE id = ?', (post_id,), one=True)
+    post = query_db('SELECT id, user_id, coauthor_id FROM posts WHERE id = ?', (post_id,), one=True)
 
     # Check if the post exists and if the current user is the owner
     if not post:
         flash('Post not found.', 'danger')
         return redirect(url_for('feed'))
 
-    if post['user_id'] != user_id:
+    if user_id not in (post['user_id'], post['coauthor_id']):
         # Security check: prevent users from deleting others' posts
         flash('You do not have permission to delete this post.', 'danger')
         return redirect(url_for('feed'))
@@ -359,12 +473,23 @@ def user_profile(username):
     moderated_bio, _ = moderate_content(user.get('profile', ''))
     user['profile'] = moderated_bio
 
-    posts_raw = query_db('SELECT id, content, user_id, created_at FROM posts WHERE user_id = ? ORDER BY created_at DESC', (user['id'],))
+    posts_raw = query_db(
+        '''SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.user_id, p.created_at,
+                  author.username, coauthor.username AS coauthor_username
+           FROM posts p
+           JOIN users author ON author.id = p.user_id
+           LEFT JOIN users coauthor ON coauthor.id = p.coauthor_id
+           WHERE p.user_id = ? OR p.coauthor_id = ?
+           ORDER BY p.created_at DESC''',
+        (user['id'], user['id'])
+    )
     posts = []
     for post_raw in posts_raw:
         post = dict(post_raw)
         moderated_post_content, _ = moderate_content(post['content'])
         post['content'] = moderated_post_content
+        if post['coauthor_content']:
+            post['coauthor_content'], _ = moderate_content(post['coauthor_content'])
         posts.append(post)
 
     comments_raw = query_db('SELECT id, content, user_id, post_id, created_at FROM comments WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', (user['id'],))
@@ -481,14 +606,15 @@ def post_detail(post_id):
     """Displays a single post and its comments, with content moderation applied."""
     
     post_raw = query_db('''
-        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.created_at,
+               u.username, u.id as user_id, coauthor.username as coauthor_username
         FROM posts p
         JOIN users u ON p.user_id = u.id
+        LEFT JOIN users coauthor ON p.coauthor_id = coauthor.id
         WHERE p.id = ?
     ''', (post_id,), one=True)
 
     if not post_raw:
-        # The abort function will stop the request and show a 404 Not Found page.
         abort(404)
 
     #  Moderation for the Main Post 
@@ -497,6 +623,8 @@ def post_detail(post_id):
     # Unpack the tuple from moderate_content, we only need the moderated content string here
     moderated_post_content, _ = moderate_content(post['content'])
     post['content'] = moderated_post_content
+    if post['coauthor_content']:
+        post['coauthor_content'], _ = moderate_content(post['coauthor_content'])
 
     #  Fetch Reactions (No moderation needed) 
     reactions = query_db('''
@@ -857,8 +985,12 @@ def admin_dashboard():
     total_posts_pages = (total_posts_count + PAGE_SIZE - 1) // PAGE_SIZE
 
     posts_raw = query_db(f'''
-        SELECT p.id, p.content, p.created_at, u.username, u.created_at as user_created_at
-        FROM posts p JOIN users u ON p.user_id = u.id
+        SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.created_at,
+               u.id AS user_id, u.username, u.created_at as user_created_at,
+               coauthor.username AS coauthor_username
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        LEFT JOIN users coauthor ON p.coauthor_id = coauthor.id
         ORDER BY p.id DESC -- Order by ID for consistent pagination before risk sort
         LIMIT ? OFFSET ?
     ''', (PAGE_SIZE, posts_offset))
@@ -1020,8 +1152,11 @@ def recommend(user_id, filter_following):
     recommended_posts = {}
 
     query = """
-        SELECT DISTINCT p.*
+        SELECT DISTINCT p.*, u.username, u.id AS user_id,
+               coauthor.username AS coauthor_username
         FROM posts p
+        JOIN users u ON u.id = p.user_id
+        LEFT JOIN users coauthor ON coauthor.id = p.coauthor_id
         WHERE p.user_id IN (
             SELECT followed_id
             FROM follows
