@@ -10,6 +10,9 @@
       <div class="col-md-12">
         <div class="card-body">
           <h2 class="card-title">{{ user_display(user.username) }}</h2>
+          {% if user.is_new_member %}
+          <p class="alert alert-info">{{ user.username }} is new on Mini Social! Perhaps they're a new fridend to be made :o</p>
+          {% endif %}
           <p class="card-text text-muted mb-3">
             <strong>Location:</strong> {{ user.location or "N/A" }}<br>
             <strong>Birthdate:</strong> {{ user.birthdate or "N/A" }}<br>
@@ -58,9 +61,15 @@
       <div class="card h-100 shadow-sm card-hover">
         <a href="{{ url_for('post_detail', post_id=post.id) }}" class="text-decoration-none text-reset">
           <div class="card-body">
-            <p class="card-text"><strong>@{{ post.username }}</strong><br>{{ post.content|truncate(100, True, '...') }}</p>
+            <p class="card-text"><strong>@{{ post.username }}</strong>{% if post.is_first_author_post %} <span class="text-success small">First post</span>{% endif %}<br>{{ post.content|truncate(100, True, '...') }}</p>
+            {% if post.is_new_author %}
+            <p class="text-info small">{{ post.username }} is new on Mini Social! Remember to treat them kindly and understandingly :)</p>
+            {% endif %}
             {% if post.coauthor_id %}
-            <p class="card-text"><strong>@{{ post.coauthor_username }}</strong><br>{{ post.coauthor_content|truncate(100, True, '...') }}</p>
+            <p class="card-text"><strong>@{{ post.coauthor_username }}</strong>{% if post.is_first_coauthor_post %} <span class="text-success small">First post</span>{% endif %}<br>{{ post.coauthor_content|truncate(100, True, '...') }}</p>
+            {% if post.is_new_coauthor %}
+            <p class="text-info small">{{ post.coauthor_username }} is new on Mini Social! Remember to treat them kindly and understandingly :)</p>
+            {% endif %}
             {% endif %}
             <small class="text-muted">Posted on {{ post.created_at|datetimeformat }}</small>
           </div>
@@ -86,6 +95,9 @@
           <div class="card-body">
             <!-- Display the comment content -->
             <p class="card-text">{{ comment.content|truncate(100, True, '...') }}</p>
+            {% if comment.is_new_author %}
+            <p class="text-info small">{{ comment.username }} is new on Mini Social! Remember to treat them kindly and understandingly :)</p>
+            {% endif %}
             <!-- Updated text to show it's a comment -->
             <small class="text-muted">Commented on {{ comment.created_at|datetimeformat }}</small>
           </div>

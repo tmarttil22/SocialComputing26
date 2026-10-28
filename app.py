@@ -155,6 +155,13 @@ def datetimeformat(value):
         return "N/A"
     return dt.strftime('%b %d, %Y %H:%M')
 
+
+def is_new_user(created_at):
+    if isinstance(created_at, str):
+        created_at = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+    return created_at is not None and (datetime.now() - created_at).days < 7
+
+
 REACTION_EMOJIS = {
     'like': '❤️', 'love': '😍', 'laugh': '😂',
     'wow': '😮', 'sad': '😢', 'angry': '😠',
@@ -251,7 +258,20 @@ def feed():
     if sort == 'popular':
         query = f"""
             SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.created_at,
-                   u.username, u.id as user_id, coauthor.username as coauthor_username,
+                   u.username, u.id as user_id, u.created_at as user_created_at,
+                   coauthor.username as coauthor_username, coauthor.created_at as coauthor_created_at,
+                   NOT EXISTS (
+                       SELECT 1 FROM posts previous
+                       WHERE (previous.user_id = u.id OR previous.coauthor_id = u.id)
+                         AND (previous.created_at < p.created_at
+                              OR (previous.created_at = p.created_at AND previous.id < p.id))
+                   ) AS is_first_author_post,
+                   NOT EXISTS (
+                       SELECT 1 FROM posts previous
+                       WHERE (previous.user_id = coauthor.id OR previous.coauthor_id = coauthor.id)
+                         AND (previous.created_at < p.created_at
+                              OR (previous.created_at = p.created_at AND previous.id < p.id))
+                   ) AS is_first_coauthor_post,
                    IFNULL(r.total_reactions, 0) as total_reactions
             FROM posts p
             JOIN users u ON p.user_id = u.id
@@ -270,7 +290,20 @@ def feed():
     else:  # Default sort is 'new'
         query = f"""
             SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.created_at,
-                   u.username, u.id as user_id, coauthor.username as coauthor_username
+                   u.username, u.id as user_id, u.created_at as user_created_at,
+                   coauthor.username as coauthor_username, coauthor.created_at as coauthor_created_at,
+                   NOT EXISTS (
+                       SELECT 1 FROM posts previous
+                       WHERE (previous.user_id = u.id OR previous.coauthor_id = u.id)
+                         AND (previous.created_at < p.created_at
+                              OR (previous.created_at = p.created_at AND previous.id < p.id))
+                   ) AS is_first_author_post,
+                   NOT EXISTS (
+                       SELECT 1 FROM posts previous
+                       WHERE (previous.user_id = coauthor.id OR previous.coauthor_id = coauthor.id)
+                         AND (previous.created_at < p.created_at
+                              OR (previous.created_at = p.created_at AND previous.id < p.id))
+                   ) AS is_first_coauthor_post
             FROM posts p
             JOIN users u ON p.user_id = u.id
             LEFT JOIN users coauthor ON p.coauthor_id = coauthor.id
@@ -306,16 +339,36 @@ def feed():
                 user_reaction = reaction_check['reaction_type']
 
         reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],))
-        comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
+        comments_raw = query_db('''
+            SELECT c.id, c.content, c.created_at, u.username, u.id as user_id,
+                   u.created_at as user_created_at
+            FROM comments c
+            JOIN users u ON c.user_id = u.id
+            WHERE c.post_id = ?
+            ORDER BY c.created_at ASC
+        ''', (post['id'],))
         post_dict = dict(post)
         post_dict['content'], _ = moderate_content(post_dict['content'])
+        post_dict['is_new_author'] = is_new_user(post_dict['user_created_at'])
         if post_dict.get('coauthor_content'):
             post_dict['coauthor_content'], _ = moderate_content(post_dict['coauthor_content'])
+        post_dict['is_new_coauthor'] = is_new_user(post_dict.get('coauthor_created_at'))
         comments_moderated = []
         for comment in comments_raw:
             comment_dict = dict(comment)
             comment_dict['content'], _ = moderate_content(comment_dict['content'])
+            comment_dict['is_new_author'] = is_new_user(comment_dict['user_created_at'])
             comments_moderated.append(comment_dict)
+        viewer_is_new_post_author = current_user_id is not None and (
+            (post_dict['user_id'] == current_user_id and post_dict['is_new_author'])
+            or (post_dict.get('coauthor_id') == current_user_id and post_dict['is_new_coauthor'])
+        )
+        if viewer_is_new_post_author:
+            visible_comments = comments_moderated[-2:]
+            for comment in visible_comments:
+                if comment['user_id'] != current_user_id:
+                    comment['show_first_comment_notice'] = True
+                    break
         posts_data.append({
             'post': post_dict,
             'reactions': reactions,
@@ -339,6 +392,11 @@ def feed():
         ''',
         (current_user_id,)
     ) if current_user_id else []
+    has_posted = bool(query_db(
+        'SELECT 1 FROM posts WHERE user_id = ? OR coauthor_id = ? LIMIT 1',
+        (current_user_id, current_user_id),
+        one=True
+    )) if current_user_id else False
     return render_template('feed.html.j2', 
                            posts=posts_data, 
                            current_sort=sort,
@@ -349,7 +407,8 @@ def feed():
                            reaction_types=REACTION_TYPES,
                            suggested_hashtag=random.choice(interest_hashtags) if interest_hashtags else None,
                            popular_hashtag=popular_hashtag,
-                           coauthor_users=coauthor_users)
+                           coauthor_users=coauthor_users,
+                           has_posted=has_posted)
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -512,12 +571,25 @@ def user_profile(username):
         abort(404)
 
     user = dict(user_raw)
-    moderated_bio, _ = moderate_content(user.get('profile', ''))
+    moderated_bio, _ = moderate_content(user.get('profile') or '')
     user['profile'] = moderated_bio
 
     posts_raw = query_db(
         '''SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.user_id, p.created_at,
-                  author.username, coauthor.username AS coauthor_username
+                  author.username, author.created_at AS author_created_at,
+                  coauthor.username AS coauthor_username, coauthor.created_at AS coauthor_created_at,
+                  NOT EXISTS (
+                      SELECT 1 FROM posts previous
+                      WHERE (previous.user_id = author.id OR previous.coauthor_id = author.id)
+                        AND (previous.created_at < p.created_at
+                             OR (previous.created_at = p.created_at AND previous.id < p.id))
+                  ) AS is_first_author_post,
+                  NOT EXISTS (
+                      SELECT 1 FROM posts previous
+                      WHERE (previous.user_id = coauthor.id OR previous.coauthor_id = coauthor.id)
+                        AND (previous.created_at < p.created_at
+                             OR (previous.created_at = p.created_at AND previous.id < p.id))
+                  ) AS is_first_coauthor_post
            FROM posts p
            JOIN users author ON author.id = p.user_id
            LEFT JOIN users coauthor ON coauthor.id = p.coauthor_id
@@ -530,16 +602,28 @@ def user_profile(username):
         post = dict(post_raw)
         moderated_post_content, _ = moderate_content(post['content'])
         post['content'] = moderated_post_content
+        post['is_new_author'] = is_new_user(post['author_created_at'])
         if post['coauthor_content']:
             post['coauthor_content'], _ = moderate_content(post['coauthor_content'])
+        post['is_new_coauthor'] = is_new_user(post['coauthor_created_at'])
         posts.append(post)
 
-    comments_raw = query_db('SELECT id, content, user_id, post_id, created_at FROM comments WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', (user['id'],))
+    user['is_new_member'] = is_new_user(user['created_at'])
+    comments_raw = query_db('''
+        SELECT c.id, c.content, c.user_id, c.post_id, c.created_at,
+               u.username, u.created_at AS user_created_at
+        FROM comments c
+        JOIN users u ON u.id = c.user_id
+        WHERE c.user_id = ?
+        ORDER BY c.created_at DESC
+        LIMIT 100
+    ''', (user['id'],))
     comments = []
     for comment_raw in comments_raw:
         comment = dict(comment_raw)
         moderated_comment_content, _ = moderate_content(comment['content'])
         comment['content'] = moderated_comment_content
+        comment['is_new_author'] = is_new_user(comment['user_created_at'])
         comments.append(comment)
 
     followers_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE followed_id = ?', (user['id'],), one=True)['cnt']
@@ -649,7 +733,20 @@ def post_detail(post_id):
     
     post_raw = query_db('''
         SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.created_at,
-               u.username, u.id as user_id, coauthor.username as coauthor_username
+               u.username, u.id as user_id, u.created_at as user_created_at,
+               coauthor.username as coauthor_username, coauthor.created_at as coauthor_created_at,
+               NOT EXISTS (
+                   SELECT 1 FROM posts previous
+                   WHERE (previous.user_id = u.id OR previous.coauthor_id = u.id)
+                     AND (previous.created_at < p.created_at
+                          OR (previous.created_at = p.created_at AND previous.id < p.id))
+               ) AS is_first_author_post,
+               NOT EXISTS (
+                   SELECT 1 FROM posts previous
+                   WHERE (previous.user_id = coauthor.id OR previous.coauthor_id = coauthor.id)
+                     AND (previous.created_at < p.created_at
+                          OR (previous.created_at = p.created_at AND previous.id < p.id))
+               ) AS is_first_coauthor_post
         FROM posts p
         JOIN users u ON p.user_id = u.id
         LEFT JOIN users coauthor ON p.coauthor_id = coauthor.id
@@ -665,8 +762,10 @@ def post_detail(post_id):
     # Unpack the tuple from moderate_content, we only need the moderated content string here
     moderated_post_content, _ = moderate_content(post['content'])
     post['content'] = moderated_post_content
+    post['is_new_author'] = is_new_user(post['user_created_at'])
     if post['coauthor_content']:
         post['coauthor_content'], _ = moderate_content(post['coauthor_content'])
+    post['is_new_coauthor'] = is_new_user(post['coauthor_created_at'])
 
     #  Fetch Reactions (No moderation needed) 
     reactions = query_db('''
@@ -677,7 +776,14 @@ def post_detail(post_id):
     ''', (post_id,))
 
     #  Fetch and Moderate Comments 
-    comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post_id,))
+    comments_raw = query_db('''
+        SELECT c.id, c.content, c.created_at, u.username, u.id as user_id,
+               u.created_at as user_created_at
+        FROM comments c
+        JOIN users u ON c.user_id = u.id
+        WHERE c.post_id = ?
+        ORDER BY c.created_at ASC
+    ''', (post_id,))
     
     comments = [] # Create a new list for the moderated comments
     for comment_raw in comments_raw:
@@ -686,7 +792,19 @@ def post_detail(post_id):
         print(comment['content'])
         moderated_comment_content, _ = moderate_content(comment['content'])
         comment['content'] = moderated_comment_content
+        comment['is_new_author'] = is_new_user(comment['user_created_at'])
         comments.append(comment)
+
+    current_user_id = session.get('user_id')
+    viewer_is_new_post_author = current_user_id is not None and (
+        (post['user_id'] == current_user_id and post['is_new_author'])
+        or (post.get('coauthor_id') == current_user_id and post['is_new_coauthor'])
+    )
+    if viewer_is_new_post_author:
+        for comment in comments:
+            if comment['user_id'] != current_user_id:
+                comment['show_first_comment_notice'] = True
+                break
 
     # Pass the moderated data to the template
     return render_template('post_detail.html.j2',
@@ -1197,7 +1315,19 @@ def admin_dashboard():
     posts_raw = query_db(f'''
         SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.created_at,
                u.id AS user_id, u.username, u.created_at as user_created_at,
-               coauthor.username AS coauthor_username
+               coauthor.username AS coauthor_username,
+               NOT EXISTS (
+                   SELECT 1 FROM posts previous
+                   WHERE (previous.user_id = u.id OR previous.coauthor_id = u.id)
+                     AND (previous.created_at < p.created_at
+                          OR (previous.created_at = p.created_at AND previous.id < p.id))
+               ) AS is_first_author_post,
+               NOT EXISTS (
+                   SELECT 1 FROM posts previous
+                   WHERE (previous.user_id = coauthor.id OR previous.coauthor_id = coauthor.id)
+                     AND (previous.created_at < p.created_at
+                          OR (previous.created_at = p.created_at AND previous.id < p.id))
+               ) AS is_first_coauthor_post
         FROM posts p
         JOIN users u ON p.user_id = u.id
         LEFT JOIN users coauthor ON p.coauthor_id = coauthor.id
@@ -1359,35 +1489,72 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {}
+    followed_ids = set()
+    positive_reaction_bonus = {}
+    positive_reactions = ('like', 'love', 'wow', 'haha')
 
-    query = """
-        SELECT DISTINCT p.*, u.username, u.id AS user_id,
-               coauthor.username AS coauthor_username
+    if user_id:
+        followed_users = query_db(
+            'SELECT followed_id FROM follows WHERE follower_id = ?',
+            (user_id,)
+        )
+        followed_ids = {row['followed_id'] for row in followed_users}
+
+        positively_reacted_posts = query_db('''
+            SELECT DISTINCT p.user_id, p.coauthor_id
+            FROM reactions r
+            JOIN posts p ON p.id = r.post_id
+            WHERE r.user_id = ?
+              AND r.reaction_type IN (?, ?, ?, ?)
+        ''', (user_id, *positive_reactions))
+        for post in positively_reacted_posts:
+            for author_id in {post['user_id'], post['coauthor_id']} - {None, user_id}:
+                positive_reaction_bonus[author_id] = positive_reaction_bonus.get(author_id, 0) + 1
+
+    candidates = query_db('''
+        SELECT p.id, p.content, p.coauthor_id, p.coauthor_content, p.created_at,
+               u.username, u.id AS user_id, u.created_at AS user_created_at,
+               coauthor.username AS coauthor_username,
+               coauthor.created_at AS coauthor_created_at,
+               NOT EXISTS (
+                   SELECT 1 FROM posts previous
+                   WHERE (previous.user_id = u.id OR previous.coauthor_id = u.id)
+                     AND (previous.created_at < p.created_at
+                          OR (previous.created_at = p.created_at AND previous.id < p.id))
+               ) AS is_first_author_post,
+               NOT EXISTS (
+                   SELECT 1 FROM posts previous
+                   WHERE (previous.user_id = coauthor.id OR previous.coauthor_id = coauthor.id)
+                     AND (previous.created_at < p.created_at
+                          OR (previous.created_at = p.created_at AND previous.id < p.id))
+               ) AS is_first_coauthor_post
         FROM posts p
         JOIN users u ON u.id = p.user_id
         LEFT JOIN users coauthor ON coauthor.id = p.coauthor_id
-        WHERE p.user_id IN (
-            SELECT followed_id
-            FROM follows
-            WHERE follower_id = ?
+        WHERE (? IS NULL OR (p.user_id != ? AND (p.coauthor_id IS NULL OR p.coauthor_id != ?)))
+          AND (? IS NULL OR NOT EXISTS (
+              SELECT 1 FROM reactions r
+              WHERE r.user_id = ? AND r.post_id = p.id
+          ))
+        ORDER BY p.created_at DESC, p.id DESC
+    ''', (user_id, user_id, user_id, user_id, user_id))
+
+    ranked_posts = []
+    for post in candidates:
+        author_ids = {post['user_id'], post['coauthor_id']} - {None, user_id}
+        if filter_following and not author_ids.intersection(followed_ids):
+            continue
+
+        followed_author = bool(author_ids.intersection(followed_ids))
+        interaction_score = max(
+            (positive_reaction_bonus.get(author_id, 0) for author_id in author_ids),
+            default=0
         )
-        OR
-        p.user_id IN (
-            SELECT user2.user_id
-            FROM reactions user1
-            JOIN reactions user2 ON user1.post_id = user2.post_id
-            WHERE user1.user_id = ? 
-            AND user2.user_id != ?
-            AND user1.reaction_type IN ('like', 'wow', 'love', 'haha')
-            AND user2.reaction_type IN ('like', 'wow', 'love', 'haha') 
-        )
-        AND p.user_id != ?
-        ORDER BY p.created_at DESC
-        LIMIT 5
-    """ 
-    recommended_posts = query_db(query, (user_id, user_id, user_id, user_id))
-    return recommended_posts
+        relevance_score = (3 if followed_author else 0) + interaction_score
+        ranked_posts.append((relevance_score, post))
+
+    ranked_posts.sort(key=lambda item: item[0], reverse=True)
+    return [post for _, post in ranked_posts[:5]]
 
 def user_risk_analysis(user_id):
     """

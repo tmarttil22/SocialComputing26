@@ -22,7 +22,8 @@
       {% if popular_hashtag %}
       <p>@{{ popular_hashtag.username }} and {{ popular_hashtag.count - 1 }} other(s) have recently posted about {{ popular_hashtag.hashtag }}, consider chipping in!</p>
       {% endif %}
-      <div class="dropdown mb-3">
+      <div class="d-flex align-items-center gap-2 mb-3">
+      <div class="dropdown">
         <button class="btn btn-outline-primary dropdown-toggle" type="button" id="coauthorDropdown" data-current-username="{{ session.get('username') }}" data-bs-toggle="dropdown" aria-expanded="false">
           Co-create a post
         </button>
@@ -34,11 +35,15 @@
           {% endfor %}
         </ul>
       </div>
+      {% if not has_posted %}
+      <button class="btn btn-outline-info btn-sm" type="button" id="introduction-post" data-username="{{ session.get('username') }}">Introduction post</button>
+      {% endif %}
+      </div>
       <p id="coauthor-selected" class="d-none"></p>
       <p id="coauthor-note" class="d-none"></p>
       <form action="{{ url_for('add_post') }}" method="POST">
         <div class="mb-3">
-          <textarea class="form-control" name="content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" required></textarea>
+          <textarea class="form-control" id="post-content" name="content" rows="3" placeholder="What's on your mind, {{ session.get('username') }}?" required></textarea>
         </div>
         <input type="hidden" name="coauthor_id" id="coauthor-id" value="">
         <button type="submit" id="post-submit" class="btn btn-primary float-end">Post</button>
@@ -49,6 +54,18 @@
 {% endif %}
 
 <script>
+  const introductionPostButton = document.getElementById('introduction-post');
+  if (introductionPostButton) {
+    introductionPostButton.addEventListener('click', () => {
+      const username = introductionPostButton.dataset.username;
+      document.getElementById('post-content').value =
+        `[Choose a friendly introduction, example "Hi, im ${username}"]\n\n` +
+        `I'm interested in [X] and [Y], I would be very glad to get to know like minded people!\n\n` +
+        `[Let others know more interesting facts about yourself]\n\n` +
+        `I'll be glad to get to know you all :)`;
+    });
+  }
+
   document.querySelectorAll('.coauthor-option').forEach((option) => {
     option.addEventListener('click', () => {
       const username = option.dataset.username;
@@ -124,9 +141,15 @@
       </div>
       
       <div class="mt-2">
-        <p class="mb-2"><strong>@{{ entry.post.username }}</strong><br>{{ entry.post.content }}</p>
+        <p class="mb-2"><strong>@{{ entry.post.username }}</strong>{% if entry.post.is_first_author_post %} <span class="text-success small">First post</span>{% endif %}<br>{{ entry.post.content }}</p>
+        {% if entry.post.is_new_author %}
+        <p class="text-info small">{{ entry.post.username }} is new on Mini Social! Remember to treat them kindly and understandingly :)</p>
+        {% endif %}
         {% if entry.post.coauthor_id %}
-        <p class="mb-2"><strong>@{{ entry.post.coauthor_username }}</strong><br>{{ entry.post.coauthor_content }}</p>
+        <p class="mb-2"><strong>@{{ entry.post.coauthor_username }}</strong>{% if entry.post.is_first_coauthor_post %} <span class="text-success small">First post</span>{% endif %}<br>{{ entry.post.coauthor_content }}</p>
+        {% if entry.post.is_new_coauthor %}
+        <p class="text-info small">{{ entry.post.coauthor_username }} is new on Mini Social! Remember to treat them kindly and understandingly :)</p>
+        {% endif %}
         {% endif %}
       </div>
 
@@ -192,6 +215,12 @@
             <div>
               <strong><a href="/u/{{ comment.username }}">{{ user_display(comment.username) }}</a></strong>
               <p class="mb-0">{{ comment.content }}</p>
+              {% if comment.is_new_author %}
+              <p class="text-info small mb-0">{{ comment.username }} is new on Mini Social! Remember to treat them kindly and understandingly :)</p>
+              {% endif %}
+              {% if comment.show_first_comment_notice %}
+              <p class="text-info small mb-0">You got your first comment! Make conversation, reply to them!</p>
+              {% endif %}
             </div>
             
             {% if session.get('user_id') == comment.user_id or session.get('user_id') == entry.post.user_id %}

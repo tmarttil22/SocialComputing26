@@ -122,9 +122,9 @@
                             {% endif %}
                         </td>
                         <td style="max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="{{ post.content }}{% if post.coauthor_content %} | {{ post.coauthor_content }}{% endif %}">
-                            <a href="{{ url_for('post_detail', post_id=post.id) }}"><strong>@{{ post.username }}:</strong> {{ post.content }}</a>
+                            <a href="{{ url_for('post_detail', post_id=post.id) }}"><strong>@{{ post.username }}:</strong>{% if post.is_first_author_post %} <span class="text-success">First post</span>{% endif %} {{ post.content }}</a>
                             {% if post.coauthor_id %}
-                            <br><a href="{{ url_for('post_detail', post_id=post.id) }}"><strong>@{{ post.coauthor_username }}:</strong> {{ post.coauthor_content }}</a>
+                            <br><a href="{{ url_for('post_detail', post_id=post.id) }}"><strong>@{{ post.coauthor_username }}:</strong>{% if post.is_first_coauthor_post %} <span class="text-success">First post</span>{% endif %} {{ post.coauthor_content }}</a>
                             {% endif %}
                         </td>
                         <td>{{ post.created_at|datetimeformat }}</td>

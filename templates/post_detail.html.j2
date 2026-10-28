@@ -28,9 +28,15 @@
       </div>
       
       <div class="mt-2">
-        <p class="card-text mb-2"><strong>@{{ post.username }}</strong><br>{{ post.content }}</p>
+        <p class="card-text mb-2"><strong>@{{ post.username }}</strong>{% if post.is_first_author_post %} <span class="text-success small">First post</span>{% endif %}<br>{{ post.content }}</p>
+        {% if post.is_new_author %}
+        <p class="text-info small">{{ post.username }} is new on Mini Social! Remember to treat them kindly and understandingly :)</p>
+        {% endif %}
         {% if post.coauthor_id %}
-        <p class="card-text mb-2"><strong>@{{ post.coauthor_username }}</strong><br>{{ post.coauthor_content }}</p>
+        <p class="card-text mb-2"><strong>@{{ post.coauthor_username }}</strong>{% if post.is_first_coauthor_post %} <span class="text-success small">First post</span>{% endif %}<br>{{ post.coauthor_content }}</p>
+        {% if post.is_new_coauthor %}
+        <p class="text-info small">{{ post.coauthor_username }} is new on Mini Social! Remember to treat them kindly and understandingly :)</p>
+        {% endif %}
         {% endif %}
       </div>
 
@@ -93,6 +99,12 @@
             <div>
               <strong><a href="/u/{{ comment.username }}">{{ user_display(comment.username) }}</a></strong>
               <p class="mb-0">{{ comment.content }}</p>
+              {% if comment.is_new_author %}
+              <p class="text-info small mb-0">{{ comment.username }} is new on Mini Social! Remember to treat them kindly and understandingly :)</p>
+              {% endif %}
+              {% if comment.show_first_comment_notice %}
+              <p class="text-info small mb-0">You got your first comment! Make conversation, reply to them!</p>
+              {% endif %}
               
             
             {% if session.get('user_id') == comment.user_id or session.get('user_id') == post.user_id %}
